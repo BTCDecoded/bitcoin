@@ -2342,7 +2342,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     }
 
     const char* script_check_reason;
-    if (m_chainman.AssumedValidBlock().IsNull()) {
+    if (m_chainman.m_options.skip_all_scripts) {
+        // Bypass all script/signature validation — used in BLVM diff-testing for throughput.
+        // ConnectBlock will still validate UTXO transitions, coinbase rules, sigops, etc.
+        script_check_reason = nullptr;
+    } else if (m_chainman.AssumedValidBlock().IsNull()) {
         script_check_reason = "assumevalid=0 (always verify)";
     } else {
         constexpr int64_t TWO_WEEKS_IN_SECONDS{60 * 60 * 24 * 7 * 2};

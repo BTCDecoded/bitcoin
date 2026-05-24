@@ -1311,6 +1311,12 @@ public:
         return btck_chainstate_manager_import_blocks(get(), c_paths.data(), c_paths_lens.data(), c_paths.size()) == 0;
     }
 
+    /** Import BLVM fixed-v1 UTXO snapshot (see `btck_chainstate_manager_import_blvm_utxo_snapshot_fixed_v1`). */
+    bool ImportBlvmUtxoSnapshotFixedV1(std::string_view path)
+    {
+        return btck_chainstate_manager_import_blvm_utxo_snapshot_fixed_v1(get(), path.data(), path.size()) == 0;
+    }
+
     bool ProcessBlock(const Block& block, bool* new_block)
     {
         int _new_block;

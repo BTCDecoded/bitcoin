@@ -1195,6 +1195,35 @@ BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_o
     int wipe_chainstate_db) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
+ * @brief When @p defer is 1, @ref btck_chainstate_manager_create skips @ref ActivateBestChains so the
+ * UTXO set is not populated from the genesis block (harness path for @ref btck_chainstate_manager_seed_headless).
+ */
+BITCOINKERNEL_API void btck_chainstate_manager_options_set_defer_activate_best_chains(
+    btck_ChainstateManagerOptions* chainstate_manager_options,
+    int defer) BITCOINKERNEL_ARG_NONNULL(1);
+
+/**
+ * @brief Override the in-memory coins (UTXO) cache size for the chainstate manager.
+ *        Default is DEFAULT_KERNEL_CACHE (~450 MiB). Set to a smaller value (e.g. 50 MiB)
+ *        to reduce RSS when running memory-constrained differential tests.
+ */
+BITCOINKERNEL_API void btck_chainstate_manager_options_set_coins_cache_bytes(
+    btck_ChainstateManagerOptions* chainstate_manager_options,
+    size_t cache_bytes) BITCOINKERNEL_ARG_NONNULL(1);
+
+/**
+ * @brief Skip all script/signature verification when connecting blocks.
+ *
+ * Intended for BLVM differential testing where historical script validity is already
+ * established and only UTXO accounting / consensus logic is under test. ConnectBlock
+ * still validates UTXO transitions, coinbase rules, sigops counts, etc.
+ *
+ * @param[in] chainstate_manager_options   Non-null, created by @ref btck_chainstate_manager_options_create.
+ */
+BITCOINKERNEL_API void btck_chainstate_manager_options_set_skip_scripts(
+    btck_ChainstateManagerOptions* chainstate_manager_options) BITCOINKERNEL_ARG_NONNULL(1);
+
+/**
  * @brief Sets block tree db in memory in the options.
  *
  * @param[in] chainstate_manager_options   Non-null, created by @ref btck_chainstate_manager_options_create.
@@ -1273,6 +1302,49 @@ BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_i
     btck_ChainstateManager* chainstate_manager,
     const char** block_file_paths_data, size_t* block_file_paths_lens,
     size_t block_file_paths_data_len) BITCOINKERNEL_ARG_NONNULL(1);
+
+/**
+ * @brief Import a BLVM fixed-v1 UTXO snapshot (magic `BLVMUX01`) into the active chainstate.
+ *
+ * Interchange format is documented by Bitcoin Commons (`UTXO_SNAPSHOT_FIXED_V1`). Requires an empty
+ * coins view (e.g. wiped chainstate) and a block index tip height equal to the snapshot height in the file.
+ *
+ * @param[in] chainstate_manager Non-null.
+ * @param[in] path               UTF-8 path to the snapshot file.
+ * @param[in] path_len           Byte length of `path`.
+ * @return                       0 on success, non-zero on error (see logs).
+ */
+BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_import_blvm_utxo_snapshot_fixed_v1(
+    btck_ChainstateManager* chainstate_manager,
+    const char* path,
+    size_t path_len) BITCOINKERNEL_ARG_NONNULL(1, 2);
+
+/**
+ * @brief Seed a headless chainstate from a BLVM fixed-v1 UTXO snapshot and raw block headers.
+ *
+ * No pre-built block index is required.  Creates synthetic CBlockIndex stubs from the provided
+ * serialized block headers (80 bytes each, ascending, ending at the snapshot height H), loads
+ * the UTXO set from the snapshot, and sets the chain tip to H.  After this call,
+ * @ref btck_chainstate_manager_process_block can be used for blocks H+1 onward.
+ *
+ * Provide at least the last 11 headers (height H-10 through H) for correct MedianTimePast in
+ * nLockTime / CSV validation.  Providing fewer headers is allowed but may produce wrong results
+ * for transactions with lock-time constraints early in the comparison window.
+ *
+ * @param[in] chainstate_manager Non-null.  Coins DB must be empty (wipe first if needed).
+ * @param[in] path               UTF-8 path to the fixed-v1 snapshot file.
+ * @param[in] path_len           Byte length of `path`.
+ * @param[in] block_headers      Serialized 80-byte block headers in ascending height order,
+ *                               ending at height H (the snapshot height).
+ * @param[in] n_headers          Number of headers in `block_headers` (>= 1).
+ * @return                       0 on success, non-zero on error (see logs).
+ */
+BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_seed_headless(
+    btck_ChainstateManager* chainstate_manager,
+    const char* path,
+    size_t path_len,
+    const unsigned char* block_headers,
+    size_t n_headers) BITCOINKERNEL_ARG_NONNULL(1, 2, 4);
 
 /**
  * @brief Process and validate the passed in block with the chainstate

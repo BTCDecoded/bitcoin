@@ -48,6 +48,10 @@ struct ChainstateManagerOpts {
     int worker_threads_num{0};
     size_t script_execution_cache_bytes{DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES};
     size_t signature_cache_bytes{DEFAULT_SIGNATURE_CACHE_BYTES};
+    //! When true, skip all script/signature verification in ConnectBlock.
+    //! Used by BLVM differential testing for throughput when historical script
+    //! validity is already established and only UTXO/consensus logic is under test.
+    bool skip_all_scripts{false};
 };
 
 } // namespace kernel

@@ -6,6 +6,8 @@
 
 #include <kernel/bitcoinkernel.h>
 
+#include <kernel/blvm_utxo_snapshot.h>
+
 #include <chain.h>
 #include <coins.h>
 #include <consensus/tx_check.h>
@@ -453,6 +455,13 @@ struct ChainstateManagerOptions {
     node::BlockManager::Options m_blockman_options GUARDED_BY(m_mutex);
     std::shared_ptr<const Context> m_context;
     node::ChainstateLoadOptions m_chainstate_load_options GUARDED_BY(m_mutex);
+    //! When true, @ref btck_chainstate_manager_create skips @ref ChainstateManager::ActivateBestChains
+    //! so the UTXO set stays empty (e.g. for @ref SeedHeadlessChainstate). Normal startup leaves this false.
+    bool m_defer_activate_best_chains GUARDED_BY(m_mutex){false};
+    //! Total cache budget for coins in-memory cache (bytes). Default: DEFAULT_KERNEL_CACHE (450 MiB).
+    //! For differential-testing tools on memory-constrained hosts, lower values (e.g. 50 MiB) reduce
+    //! Core's RSS contribution without significantly hurting IBD BPS at early heights.
+    size_t m_coins_cache_bytes GUARDED_BY(m_mutex){DEFAULT_KERNEL_CACHE};
 
     ChainstateManagerOptions(const std::shared_ptr<const Context>& context, const fs::path& data_dir, const fs::path& blocks_dir)
         : m_chainman_options{ChainstateManager::Options{
@@ -476,6 +485,12 @@ struct ChainstateManagerOptions {
 struct ChainMan {
     std::unique_ptr<ChainstateManager> m_chainman;
     std::shared_ptr<const Context> m_context;
+    // Dummy CBlockIndex stubs for headless seeding (not in block index map, but kept alive
+    // so that real stubs' pprev pointers remain valid for the lifetime of this chainman).
+    std::vector<std::unique_ptr<CBlockIndex>> m_headless_stub_chain;
+    // Synthetic block hashes for the dummy stubs above.  Each stub's phashBlock points into
+    // this vector, so it must outlive m_headless_stub_chain.
+    std::vector<uint256> m_headless_stub_hashes;
 
     ChainMan(std::unique_ptr<ChainstateManager> chainman, std::shared_ptr<const Context> context)
         : m_chainman(std::move(chainman)), m_context(std::move(context)) {}
@@ -1005,6 +1020,27 @@ int btck_chainstate_manager_options_set_wipe_dbs(btck_ChainstateManagerOptions* 
     return 0;
 }
 
+void btck_chainstate_manager_options_set_defer_activate_best_chains(btck_ChainstateManagerOptions* chainman_opts, int defer)
+{
+    auto& opts{btck_ChainstateManagerOptions::get(chainman_opts)};
+    LOCK(opts.m_mutex);
+    opts.m_defer_activate_best_chains = defer == 1;
+}
+
+void btck_chainstate_manager_options_set_coins_cache_bytes(btck_ChainstateManagerOptions* chainman_opts, size_t cache_bytes)
+{
+    auto& opts{btck_ChainstateManagerOptions::get(chainman_opts)};
+    LOCK(opts.m_mutex);
+    opts.m_coins_cache_bytes = cache_bytes;
+}
+
+void btck_chainstate_manager_options_set_skip_scripts(btck_ChainstateManagerOptions* chainman_opts)
+{
+    auto& opts{btck_ChainstateManagerOptions::get(chainman_opts)};
+    LOCK(opts.m_mutex);
+    opts.m_chainman_options.skip_all_scripts = true;
+}
+
 void btck_chainstate_manager_options_update_block_tree_db_in_memory(
     btck_ChainstateManagerOptions* chainman_opts,
     int block_tree_db_in_memory)
@@ -1039,7 +1075,7 @@ btck_ChainstateManager* btck_chainstate_manager_create(
     try {
         const auto chainstate_load_opts{WITH_LOCK(opts.m_mutex, return opts.m_chainstate_load_options)};
 
-        kernel::CacheSizes cache_sizes{DEFAULT_KERNEL_CACHE};
+        kernel::CacheSizes cache_sizes{WITH_LOCK(opts.m_mutex, return opts.m_coins_cache_bytes)};
         auto [status, chainstate_err]{node::LoadChainstate(*chainman, cache_sizes, chainstate_load_opts)};
         if (status != node::ChainstateLoadStatus::SUCCESS) {
             LogError("Failed to load chain state from your data directory: %s", chainstate_err.original);
@@ -1050,9 +1086,12 @@ btck_ChainstateManager* btck_chainstate_manager_create(
             LogError("Failed to verify loaded chain state from your datadir: %s", chainstate_err.original);
             return nullptr;
         }
-        if (auto result = chainman->ActivateBestChains(); !result) {
-            LogError("%s", util::ErrorString(result).original);
-            return nullptr;
+        const bool defer_activate{WITH_LOCK(opts.m_mutex, return opts.m_defer_activate_best_chains)};
+        if (!defer_activate) {
+            if (auto result = chainman->ActivateBestChains(); !result) {
+                LogError("%s", util::ErrorString(result).original);
+                return nullptr;
+            }
         }
     } catch (const std::exception& e) {
         LogError("Failed to load chainstate: %s", e.what());
@@ -1112,6 +1151,78 @@ int btck_chainstate_manager_import_blocks(btck_ChainstateManager* chainman, cons
         return -1;
     }
     return 0;
+}
+
+int btck_chainstate_manager_import_blvm_utxo_snapshot_fixed_v1(
+    btck_ChainstateManager* chainman,
+    const char* path,
+    size_t path_len)
+{
+    if (chainman == nullptr || path == nullptr || path_len == 0) {
+        LogError("BLVM import: null argument");
+        return -1;
+    }
+    try {
+        const fs::path p{fs::PathFromString(std::string(path, path_len))};
+        auto& cm = *btck_ChainstateManager::get(chainman).m_chainman;
+        if (auto res{kernel::LoadBlvmUtxoSnapshotFixedV1(cm, p)}; !res) {
+            LogError("BLVM import: %s", util::ErrorString(res).original);
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        LogError("BLVM import: %s", e.what());
+        return -1;
+    }
+}
+
+int btck_chainstate_manager_seed_headless(
+    btck_ChainstateManager* chainman,
+    const char* path,
+    size_t path_len,
+    const unsigned char* block_headers,
+    size_t n_headers)
+{
+    if (chainman == nullptr || path == nullptr || path_len == 0 ||
+        block_headers == nullptr || n_headers == 0) {
+        LogError("BLVM seed_headless: null/empty argument");
+        return -1;
+    }
+    try {
+        const fs::path p{fs::PathFromString(std::string(path, path_len))};
+        auto& chain_man_obj = btck_ChainstateManager::get(chainman);
+        auto& cm = *chain_man_obj.m_chainman;
+
+        // Deserialize the 80-byte raw headers into CBlockHeader objects.
+        constexpr size_t HEADER_BYTES = 80;
+        if (n_headers > 10000) {
+            LogError("BLVM seed_headless: unreasonably large n_headers=%zu", n_headers);
+            return -1;
+        }
+        std::vector<CBlockHeader> headers;
+        headers.reserve(n_headers);
+        for (size_t i = 0; i < n_headers; ++i) {
+            const unsigned char* src = block_headers + i * HEADER_BYTES;
+            CBlockHeader hdr;
+            hdr.nVersion    = ReadLE32(src + 0);
+            // hashPrevBlock and hashMerkleRoot are 32-byte little-endian fields
+            std::copy(src + 4,  src + 36, hdr.hashPrevBlock.begin());
+            std::copy(src + 36, src + 68, hdr.hashMerkleRoot.begin());
+            hdr.nTime       = ReadLE32(src + 68);
+            hdr.nBits       = ReadLE32(src + 72);
+            hdr.nNonce      = ReadLE32(src + 76);
+            headers.push_back(hdr);
+        }
+
+        if (auto res{kernel::SeedHeadlessChainstate(cm, p, headers, chain_man_obj.m_headless_stub_chain, chain_man_obj.m_headless_stub_hashes)}; !res) {
+            LogError("BLVM seed_headless: %s", util::ErrorString(res).original);
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        LogError("BLVM seed_headless: %s", e.what());
+        return -1;
+    }
 }
 
 btck_Block* btck_block_create(const void* raw_block, size_t raw_block_length)
@@ -1333,9 +1444,55 @@ int btck_chainstate_manager_process_block(
     int* _new_block)
 {
     bool new_block;
-    auto result = btck_ChainstateManager::get(chainman).m_chainman->ProcessNewBlock(btck_Block::get(block), /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&new_block);
+    auto& cm = *btck_ChainstateManager::get(chainman).m_chainman;
+    // Inline the ProcessNewBlock logic to capture both AcceptBlock and ActivateBestChain state.
+    bool result;
+    {
+        CBlockIndex* pindex = nullptr;
+        BlockValidationState ab_state;
+        LOCK(::cs_main);
+        bool check_ok = CheckBlock(*btck_Block::get(block), ab_state, cm.GetConsensus());
+        bool accept_ok = false;
+        if (check_ok) {
+            accept_ok = cm.AcceptBlock(btck_Block::get(block), ab_state, &pindex, /*fRequested=*/true, /*dbp=*/nullptr, &new_block, /*min_pow_checked=*/true);
+        }
+        if (!check_ok || !accept_ok) {
+            fprintf(stderr, "BLVM CheckBlock/AcceptBlock FAIL: %s\n", ab_state.ToString().c_str());
+            result = false;
+        } else {
+            result = true;
+        }
+    }
+    if (result) {
+        BlockValidationState abc_state;
+        if (!cm.ActiveChainstate().ActivateBestChain(abc_state, btck_Block::get(block))) {
+            fprintf(stderr, "BLVM ActivateBestChain FAIL: %s\n", abc_state.ToString().c_str());
+            result = false;
+        }
+    }
     if (_new_block) {
         *_new_block = new_block ? 1 : 0;
+    }
+    if (!result) {
+        LOCK(::cs_main);
+        auto hash = btck_Block::get(block)->GetHash();
+        const CBlockIndex* tip = cm.ActiveChain().Tip();
+        fprintf(stderr, "BLVM process_block FAIL: active_tip_height=%d\n",
+                tip ? tip->nHeight : -1);
+        auto it = cm.m_blockman.m_block_index.find(hash);
+        if (it != cm.m_blockman.m_block_index.end()) {
+            auto& idx = it->second;
+            fprintf(stderr, "  block hash=%s height=%d status=0x%x nTx=%u chainwork=%s\n",
+                     hash.ToString().c_str(), idx.nHeight, idx.nStatus, idx.nTx,
+                     idx.nChainWork.ToString().c_str());
+            if (idx.pprev) {
+                fprintf(stderr, "  pprev hash=%s height=%d chainwork=%s\n",
+                        idx.pprev->GetBlockHash().ToString().c_str(), idx.pprev->nHeight,
+                        idx.pprev->nChainWork.ToString().c_str());
+            }
+        } else {
+            fprintf(stderr, "BLVM process_block FAIL hash=%s NOT_IN_INDEX\n", hash.ToString().c_str());
+        }
     }
     return result ? 0 : -1;
 }
