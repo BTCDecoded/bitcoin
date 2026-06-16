@@ -1347,6 +1347,29 @@ BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_s
     size_t n_headers) BITCOINKERNEL_ARG_NONNULL(1, 2, 4);
 
 /**
+ * @brief Restore a headless chainstate after process restart WITHOUT re-loading the UTXO snapshot.
+ *
+ * This is a lightweight variant of @ref btck_chainstate_manager_seed_headless for use when
+ * the coins DB is already populated (from a prior run) but the process-local dummy pprev
+ * chain has been lost on restart.  It rebuilds the dummy stubs and patches the dangling
+ * pprev pointer, then restores m_chain.Tip() to the current best block.
+ *
+ * Eliminates the ~10–50 GiB glibc heap fragmentation caused by cycling CCoinsViewCache
+ * during a full re-seed of 50M+ UTXOs on every restart.
+ *
+ * @param[in] chainstate_manager Non-null. Must have been opened with
+ *                               defer_activate_best_chains=1 and coins DB already loaded.
+ * @param[in] block_headers      Same 80-byte header array passed to the original
+ *                               seed_headless call (ascending order, ending at snapshot height).
+ * @param[in] n_headers          Number of headers (>= 1, same as original call).
+ * @return                       0 on success, non-zero on error (see logs).
+ */
+BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_seed_headless_restore(
+    btck_ChainstateManager* chainstate_manager,
+    const unsigned char* block_headers,
+    size_t n_headers) BITCOINKERNEL_ARG_NONNULL(1, 2);
+
+/**
  * @brief Process and validate the passed in block with the chainstate
  * manager. Processing first does checks on the block, and if these passed,
  * saves it to disk. It then validates the block against the utxo set. If it is

@@ -1176,6 +1176,25 @@ int btck_chainstate_manager_import_blvm_utxo_snapshot_fixed_v1(
     }
 }
 
+static std::vector<CBlockHeader> parse_raw_headers(const unsigned char* block_headers, size_t n_headers)
+{
+    constexpr size_t HEADER_BYTES = 80;
+    std::vector<CBlockHeader> headers;
+    headers.reserve(n_headers);
+    for (size_t i = 0; i < n_headers; ++i) {
+        const unsigned char* src = block_headers + i * HEADER_BYTES;
+        CBlockHeader hdr;
+        hdr.nVersion = ReadLE32(src + 0);
+        std::copy(src + 4,  src + 36, hdr.hashPrevBlock.begin());
+        std::copy(src + 36, src + 68, hdr.hashMerkleRoot.begin());
+        hdr.nTime    = ReadLE32(src + 68);
+        hdr.nBits    = ReadLE32(src + 72);
+        hdr.nNonce   = ReadLE32(src + 76);
+        headers.push_back(hdr);
+    }
+    return headers;
+}
+
 int btck_chainstate_manager_seed_headless(
     btck_ChainstateManager* chainman,
     const char* path,
@@ -1193,26 +1212,11 @@ int btck_chainstate_manager_seed_headless(
         auto& chain_man_obj = btck_ChainstateManager::get(chainman);
         auto& cm = *chain_man_obj.m_chainman;
 
-        // Deserialize the 80-byte raw headers into CBlockHeader objects.
-        constexpr size_t HEADER_BYTES = 80;
         if (n_headers > 10000) {
             LogError("BLVM seed_headless: unreasonably large n_headers=%zu", n_headers);
             return -1;
         }
-        std::vector<CBlockHeader> headers;
-        headers.reserve(n_headers);
-        for (size_t i = 0; i < n_headers; ++i) {
-            const unsigned char* src = block_headers + i * HEADER_BYTES;
-            CBlockHeader hdr;
-            hdr.nVersion    = ReadLE32(src + 0);
-            // hashPrevBlock and hashMerkleRoot are 32-byte little-endian fields
-            std::copy(src + 4,  src + 36, hdr.hashPrevBlock.begin());
-            std::copy(src + 36, src + 68, hdr.hashMerkleRoot.begin());
-            hdr.nTime       = ReadLE32(src + 68);
-            hdr.nBits       = ReadLE32(src + 72);
-            hdr.nNonce      = ReadLE32(src + 76);
-            headers.push_back(hdr);
-        }
+        auto headers = parse_raw_headers(block_headers, n_headers);
 
         if (auto res{kernel::SeedHeadlessChainstate(cm, p, headers, chain_man_obj.m_headless_stub_chain, chain_man_obj.m_headless_stub_hashes)}; !res) {
             LogError("BLVM seed_headless: %s", util::ErrorString(res).original);
@@ -1221,6 +1225,36 @@ int btck_chainstate_manager_seed_headless(
         return 0;
     } catch (const std::exception& e) {
         LogError("BLVM seed_headless: %s", e.what());
+        return -1;
+    }
+}
+
+int btck_chainstate_manager_seed_headless_restore(
+    btck_ChainstateManager* chainman,
+    const unsigned char* block_headers,
+    size_t n_headers)
+{
+    if (chainman == nullptr || block_headers == nullptr || n_headers == 0) {
+        LogError("BLVM seed_headless_restore: null/empty argument");
+        return -1;
+    }
+    try {
+        auto& chain_man_obj = btck_ChainstateManager::get(chainman);
+        auto& cm = *chain_man_obj.m_chainman;
+
+        if (n_headers > 10000) {
+            LogError("BLVM seed_headless_restore: unreasonably large n_headers=%zu", n_headers);
+            return -1;
+        }
+        auto headers = parse_raw_headers(block_headers, n_headers);
+
+        if (auto res{kernel::SeedHeadlessRestore(cm, headers, chain_man_obj.m_headless_stub_chain, chain_man_obj.m_headless_stub_hashes)}; !res) {
+            LogError("BLVM seed_headless_restore: %s", util::ErrorString(res).original);
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        LogError("BLVM seed_headless_restore: %s", e.what());
         return -1;
     }
 }

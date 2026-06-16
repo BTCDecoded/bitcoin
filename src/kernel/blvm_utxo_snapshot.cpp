@@ -226,38 +226,40 @@ util::Result<void> SeedHeadlessChainstate(
             n, base_height, snap_h))};
     }
 
-    // ── Lightweight dummy stubs for heights [0, base_height) ─────────────────────────────
-    // Core's GetAncestor() walks pprev, so we need a full pprev chain from the tip to 0.
-    // These stubs are NOT inserted into the block index map (so they're invisible to
-    // pindexMostWork selection), but are heap-allocated and stored in dummy_stub_storage
-    // to outlive this function call.  The real stubs hold pprev pointers to them.
-    // ~50 bytes per stub → ~10 MB for 200k heights.
-    dummy_stub_storage.clear();
-    dummy_stub_storage.reserve(base_height);
-    dummy_hash_storage.clear();
-    dummy_hash_storage.reserve(base_height);
+    // ── Dummy stubs for heights [0, base_height) — inserted into block index for LevelDB persistence ──
+    // Core's GetAncestor() walks pprev, so we need a full pprev chain from the tip to genesis.
+    // We insert these via InsertBlockIndex so they are marked dirty and written to LevelDB on the
+    // next flush.  This allows btck_chainstate_manager_create on restart to reconstruct pprev for
+    // the first real stub (whose hashPrev is a synthetic hash only present here).  Without this
+    // the pprev chain is incomplete after reload and LoadChainstate/VerifyLoadedChainstate fails.
+    // Synthetic hashes: height in LE bytes 0-3, 0xDD sentinel in byte 4 — unique and recognizable.
+    // Their nBits=0x1d00ffff → nChainWork well below the real chain, so pindexMostWork never selects
+    // them; ActivateBestChains is deferred anyway (defer_activate_best_chains=true in all callers).
+    dummy_stub_storage.clear();  // No longer storing manual unique_ptrs; kept for API compat.
+    dummy_hash_storage.clear();  // Same; cleared for tidiness.
     CBlockIndex* prev_stub{nullptr};
     for (int h = 0; h < base_height; ++h) {
-        // Allocate a stable synthetic hash BEFORE creating the stub, so the pointer stays valid.
-        uint256& hash_slot = dummy_hash_storage.emplace_back();
-        WriteLE32(hash_slot.begin(), static_cast<uint32_t>(h));        // encode height in bytes 0-3
-        hash_slot.begin()[4] = 0xDD;                                    // sentinel byte
+        uint256 dummy_hash;
+        WriteLE32(dummy_hash.begin(), static_cast<uint32_t>(h));
+        dummy_hash.begin()[4] = 0xDD;
 
-        auto stub = std::make_unique<CBlockIndex>();
+        // InsertBlockIndex owns the CBlockIndex in m_block_index; phashBlock → map key (stable).
+        CBlockIndex* stub = chainman.m_blockman.InsertBlockIndex(dummy_hash);
+        if (stub->phashBlock != nullptr && stub->nHeight == h) {
+            // Already seeded (e.g., re-entrant call); just walk the chain.
+            prev_stub = stub;
+            continue;
+        }
         stub->nHeight    = h;
         stub->pprev      = prev_stub;
         stub->nStatus    = BLOCK_VALID_RESERVED;
         stub->nBits      = 0x1d00ffff;
         stub->nChainWork = (prev_stub ? prev_stub->nChainWork : arith_uint256{0}) + GetBlockProof(*stub);
-        // Set a synthetic m_chain_tx_count so HaveNumChainTxs() returns true for the whole pprev
-        // chain. This allows ReceivedBlockTransactions() to properly link blocks H+1 onward into
-        // setBlockIndexCandidates instead of m_blocks_unlinked, enabling ActivateBestChain.
+        // Synthetic m_chain_tx_count so HaveNumChainTxs() returns true for the pprev chain.
         stub->nTx              = 1;
         stub->m_chain_tx_count = static_cast<uint64_t>(h + 1);
-        // Set phashBlock so GetBlockHash() doesn't assert on a dummy stub during chain traversal.
-        stub->phashBlock = &hash_slot;
-        prev_stub = stub.get();
-        dummy_stub_storage.push_back(std::move(stub));
+        // phashBlock is set by InsertBlockIndex to &mi->first (the map key) — already stable.
+        prev_stub = stub;
     }
 
     // Precompute hashes to avoid re-hashing inside the lock loop.
@@ -310,6 +312,134 @@ util::Result<void> SeedHeadlessChainstate(
     chainman.m_best_header = tip_stub;
     coins_cache.Flush();
 
+    return {};
+}
+
+util::Result<void> SeedHeadlessRestore(
+    ChainstateManager& chainman,
+    const std::vector<CBlockHeader>& headers,
+    std::vector<std::unique_ptr<CBlockIndex>>& dummy_stub_storage,
+    std::vector<uint256>& dummy_hash_storage)
+{
+    if (headers.empty()) {
+        return util::Error{Untranslated("SeedHeadlessRestore: headers vector is empty")};
+    }
+
+    LOCK(::cs_main);
+    Chainstate& cs = chainman.CurrentChainstate();
+    CCoinsViewCache& coins_cache = cs.CoinsTip();
+
+    if (coins_cache.GetBestBlock().IsNull()) {
+        return util::Error{Untranslated(
+            "SeedHeadlessRestore: coins DB is empty — use SeedHeadlessChainstate for initial seed")};
+    }
+
+    // Compute hashes for the provided headers so we can look them up in the block index.
+    const int n = static_cast<int>(headers.size());
+    std::vector<uint256> hashes;
+    hashes.reserve(n);
+    for (const auto& h : headers) hashes.push_back(h.GetHash());
+
+    // Find base_height by looking up headers in the block index.
+    // After the initial seed + at least one process_block call, the real stubs [base_height,
+    // snap_h] were written to LevelDB and are present in m_blockman.m_block_index after reload.
+    int base_height{-1};
+    for (int i = 0; i < n && base_height < 0; ++i) {
+        const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hashes[i]);
+        if (pindex && pindex->nHeight >= i) {
+            base_height = pindex->nHeight - i;
+        }
+    }
+    if (base_height < 0) {
+        return util::Error{Untranslated(
+            "SeedHeadlessRestore: none of the provided headers found in block index — "
+            "ensure at least one process_block call completed before the prior shutdown")};
+    }
+    const int snap_h = base_height + n - 1;
+
+    // ── Dummy stubs for heights [0, base_height) ────────────────────────────────────────────────
+    // Two cases depending on how the Core datadir was created:
+    //
+    //  NEW (fixed SeedHeadlessChainstate): dummy stubs were inserted via InsertBlockIndex and are
+    //  already present in m_block_index after LoadBlockIndex.  pprev chain is intact; we just
+    //  need the last dummy stub pointer to patch/verify the first real stub below.
+    //
+    //  OLD (pre-fix): dummy stubs were never written to LevelDB; pprev of the first real stub is
+    //  nullptr after reload.  Rebuild them in-memory (dummy_stub_storage) and patch pprev.
+    dummy_stub_storage.clear();
+    dummy_hash_storage.clear();
+    CBlockIndex* prev_stub{nullptr};
+
+    if (base_height > 0) {
+        // Probe for the height-0 dummy stub in the block map.
+        uint256 probe_hash;
+        WriteLE32(probe_hash.begin(), 0u);
+        probe_hash.begin()[4] = 0xDD;
+        const bool dummies_in_map = chainman.m_blockman.LookupBlockIndex(probe_hash) != nullptr;
+
+        if (dummies_in_map) {
+            // New-style datadir: find the last dummy stub so we can patch real stubs below.
+            uint256 last_dummy_hash;
+            WriteLE32(last_dummy_hash.begin(), static_cast<uint32_t>(base_height - 1));
+            last_dummy_hash.begin()[4] = 0xDD;
+            prev_stub = chainman.m_blockman.LookupBlockIndex(last_dummy_hash);
+            // If lookup misses (shouldn't happen), fall through with prev_stub=nullptr; patching
+            // below will still reconnect what it can.
+        }
+
+        if (!dummies_in_map || prev_stub == nullptr) {
+            // Legacy path: dummy stubs not in LevelDB; build in-memory.
+            dummy_stub_storage.reserve(base_height);
+            dummy_hash_storage.reserve(base_height);
+            prev_stub = nullptr;
+            for (int h = 0; h < base_height; ++h) {
+                uint256& hash_slot = dummy_hash_storage.emplace_back();
+                WriteLE32(hash_slot.begin(), static_cast<uint32_t>(h));
+                hash_slot.begin()[4] = 0xDD;
+
+                auto stub = std::make_unique<CBlockIndex>();
+                stub->nHeight          = h;
+                stub->pprev            = prev_stub;
+                stub->nStatus          = BLOCK_VALID_RESERVED;
+                stub->nBits            = 0x1d00ffff;
+                stub->nChainWork       = (prev_stub ? prev_stub->nChainWork : arith_uint256{0}) + GetBlockProof(*stub);
+                stub->nTx              = 1;
+                stub->m_chain_tx_count = static_cast<uint64_t>(h + 1);
+                stub->phashBlock       = &hash_slot;
+                prev_stub = stub.get();
+                dummy_stub_storage.push_back(std::move(stub));
+            }
+        }
+    }
+
+    // ── Patch pprev for the real stubs [base_height, snap_h] ────────────────────────────────
+    // In the new-style case pprev is already correct after LoadBlockIndex, but patching is
+    // idempotent (only sets when nullptr) and cheap.
+    for (int i = 0; i < n; ++i) {
+        CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hashes[i]);
+        if (!pindex) continue;
+        if (pindex->pprev == nullptr) {
+            pindex->pprev = prev_stub;
+        }
+        prev_stub = pindex;
+    }
+
+    // ── Restore m_chain.Tip() from the coins DB best-block hash ──────────────────────────────
+    // The coins DB records the last block whose outputs were applied (updated by process_block).
+    // It is at the actual chain tip, which may be higher than snap_h if process_block ran past it.
+    const uint256& best_hash = coins_cache.GetBestBlock();
+    CBlockIndex* tip = chainman.m_blockman.LookupBlockIndex(best_hash);
+    if (!tip) {
+        return util::Error{Untranslated(strprintf(
+            "SeedHeadlessRestore: coins DB best block %s not found in block index",
+            best_hash.ToString()))};
+    }
+    cs.m_chain.SetTip(*tip);
+    chainman.m_best_header = tip;
+
+    LogInfo("SeedHeadlessRestore: restored headless chain to height %d (snap_h=%d, base_height=%d, "
+            "dummy_stubs=%zu)",
+            tip->nHeight, snap_h, base_height, dummy_stub_storage.size());
     return {};
 }
 

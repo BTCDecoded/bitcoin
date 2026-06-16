@@ -61,6 +61,39 @@ util::Result<void> SeedHeadlessChainstate(
     std::vector<std::unique_ptr<CBlockIndex>>& dummy_stub_storage,
     std::vector<uint256>& dummy_hash_storage);
 
+/**
+ * Restore a headless chainstate after a process restart WITHOUT reloading the UTXO snapshot.
+ *
+ * After a process that called SeedHeadlessChainstate exits and restarts, the block index is
+ * populated (real stubs were written to LevelDB by the first process_block call), but the
+ * dummy pprev chain [0, base_height) is gone.  This function rebuilds just the dummy chain
+ * and patches the dangling pprev pointer on the first real stub, then re-sets m_chain.Tip()
+ * to the actual current best block from the coins DB.
+ *
+ * This avoids the ~10–50 GiB glibc heap fragmentation from re-reading and inserting 57M+
+ * UTXO objects via CCoinsViewCache during a full SeedHeadlessChainstate restart.
+ *
+ * @param chainman            ChainstateManager whose coins DB is already populated (non-empty
+ *                            GetBestBlock()) and whose block index has been loaded from LevelDB.
+ * @param headers             The same ascending header run passed to the original
+ *                            SeedHeadlessChainstate call (at minimum the headers window that
+ *                            includes the snapshot height; same headers are required so that
+ *                            pprev times are correct for GetMedianTimePast).
+ * @param dummy_stub_storage  Out: receives the rebuilt dummy stubs [0, base_height).
+ * @param dummy_hash_storage  Out: receives the synthetic hashes backing those stubs.
+ *
+ * Preconditions:
+ * - Coins DB is populated (GetBestBlock() is non-null).
+ * - Block index has been loaded (LoadBlockIndex already ran via LoadChainstate).
+ * - At least one of the provided headers corresponds to a CBlockIndex in m_blockman.
+ * - m_chainstate_manager_create was called with defer_activate_best_chains = true.
+ */
+util::Result<void> SeedHeadlessRestore(
+    ChainstateManager& chainman,
+    const std::vector<CBlockHeader>& headers,
+    std::vector<std::unique_ptr<CBlockIndex>>& dummy_stub_storage,
+    std::vector<uint256>& dummy_hash_storage);
+
 } // namespace kernel
 
 #endif // BITCOIN_KERNEL_BLVM_UTXO_SNAPSHOT_H
